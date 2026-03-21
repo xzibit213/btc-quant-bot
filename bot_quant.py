@@ -415,15 +415,15 @@ class QuantBot:
         now = datetime.now(timezone.utc)
         stats = self.state.get_stats()
         return {
-            "running":           self._running,
+            "running":           bool(self._running),
             "timestamp":         now.isoformat(),
             "active_trade":      self.state.active_trade,
-            "signals_today":     self.state.signals_today,
-            "circuit_breaker":   self.state.circuit_breaker,
-            "last_signal":       round(self.last_signal, 4),
-            "last_regime_safe":  self.last_regime,
-            "last_vol_leverage": round(self.last_vol_lev, 3),
-            "last_realized_vol": round(self.last_realized_vol, 4),
+            "signals_today":     int(self.state.signals_today),
+            "circuit_breaker":   bool(self.state.circuit_breaker),
+            "last_signal":       float(round(self.last_signal, 4)),
+            "last_regime_safe":  bool(self.last_regime),
+            "last_vol_leverage": float(round(self.last_vol_lev, 3)),
+            "last_realized_vol": float(round(self.last_realized_vol, 4)),
             "stats":             stats,
             "trade_log":         self.state.get_log()[:20],
         }
