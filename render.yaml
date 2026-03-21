@@ -1,0 +1,32 @@
+# ─── RENDER DEPLOYMENT BLUEPRINT ──────────────────────────────────────────────
+# Deploy with: https://render.com/deploy → connect GitHub repo
+# This file auto-configures the Render web service.
+
+services:
+  - type: web
+    name: btc-quant-bot
+    runtime: python
+    region: oregon
+
+    # Build
+    buildCommand: pip install -r requirements.txt
+
+    # Start — runs the quant dashboard + auto-starts the trading bot
+    startCommand: gunicorn app_quant:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+
+    # Health check
+    healthCheckPath: /health
+
+    # Free tier
+    plan: free
+
+    # Environment variables (set these in Render dashboard → Environment)
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false          # Must be set manually in Render dashboard
+      - key: BINANCE_API_SECRET
+        sync: false          # Must be set manually in Render dashboard
+      - key: TESTNET
+        value: "true"        # Start with testnet, change to "false" for live
+      - key: PYTHON_VERSION
+        value: "3.12.0"
