@@ -45,7 +45,7 @@ class LiveConfig(StrategyConfig):
     TESTNET     = os.getenv("TESTNET", "true").lower() == "true"
 
     # Live overrides
-    LEVERAGE        = 10             # 10× leverage — bot manages actual risk via sizing
+    LEVERAGE        = 5              # 5× leverage cap
     EVAL_INTERVAL   = 60             # Check every 60 seconds
     CANDLE_LIMIT    = 500            # Bars to fetch for indicator computation
     DAILY_LIMIT     = 30             # Daily candles for trend bias
