@@ -28,39 +28,40 @@ class StrategyConfig:
     # ── DATA ──────────────────────────────────────────────────────────────────
     SYMBOL          = "BTCUSDT"
     INTERVAL        = "1h"
-    DATA_START      = "1 Jan 2025"       # Fetch data from this date
-    BACKTEST_START  = "1 Apr 2025"       # Begin trading from this date
+    DATA_START      = "1 Jan 2025"
+    BACKTEST_START  = "22 Mar 2025"
 
-    # ── MOMENTUM (TSMOM) ─────────────────────────────────────────────────────
-    # Multiple lookback periods (in bars) for multi-scale momentum
-    # 21h ≈ 1 day, 63h ≈ 2.6 days, 126h ≈ 5.25 days, 252h ≈ 10.5 days
-    MOMENTUM_LOOKBACKS  = [21, 63, 126, 252]
-    MOMENTUM_WEIGHTS    = [0.4, 0.3, 0.2, 0.1]   # Weight shorter periods more
-    SIGNAL_SMOOTHING    = 5                        # EMA smoothing on composite signal
+    # ── MOMENTUM (TSMOM) - Optimized for 1h ──────────────────────────────────
+    MOMENTUM_LOOKBACKS  = [12, 24, 48, 168]
+    MOMENTUM_WEIGHTS    = [0.5, 0.3, 0.15, 0.05]
+    SIGNAL_SMOOTHING    = 3
 
-    # ── VOLATILITY TARGETING ─────────────────────────────────────────────────
-    TARGET_VOL_ANNUAL   = 0.15           # 15% annualized target volatility
-    VOL_LOOKBACK        = 24             # 24 bars (hours) for realized vol
-    VOL_SCALE_FACTOR    = np.sqrt(365 * 24)  # Annualization for hourly data
-    MAX_LEVERAGE        = 3.0            # Cap leverage from vol targeting
-    MIN_LEVERAGE        = 0.1            # Floor to avoid zero positions
+    # ── VOLATILITY TARGETING - Hedge Fund Profile ────────────────────────────
+    TARGET_VOL_ANNUAL   = 0.45           # 45% annualized target volatility
+    VOL_LOOKBACK        = 24
+    VOL_SCALE_FACTOR    = np.sqrt(365 * 24)
+    MAX_LEVERAGE        = 5.0            # Capped at 5x per user request
+    MIN_LEVERAGE        = 0.1
 
     # ── REGIME DETECTION ─────────────────────────────────────────────────────
-    VOL_FAST_WINDOW     = 12             # 12-bar fast vol (short term)
-    VOL_SLOW_WINDOW     = 120            # 120-bar slow vol (long term)
-    REGIME_THRESHOLD    = 2.0            # Fast/Slow vol ratio > 2.0 = danger
-    REGIME_REDUCE_FACTOR = 0.0           # Reduce position to 0% in danger
+    VOL_FAST_WINDOW     = 12
+    VOL_SLOW_WINDOW     = 120
+    REGIME_THRESHOLD    = 2.0
+    REGIME_REDUCE_FACTOR = 0.0
 
     # ── RISK MANAGEMENT ──────────────────────────────────────────────────────
     ATR_PERIOD          = 14
-    STOP_ATR_MULT       = 2.0            # Stop-loss = 2× ATR
-    TP_ATR_MULT         = 4.0            # Take-profit = 4× ATR (2:1 RR)
-    MAX_TRADES_PER_DAY  = 2
-    RISK_PER_TRADE      = 0.02           # 2% of equity per trade
+    STOP_ATR_MULT       = 1.5            # Tighter institutional stop
+    TP_ATR_MULT         = 4.5            # 3:1 Reward-to-Risk
+    MAX_TRADES_PER_DAY  = 3
+    RISK_PER_TRADE      = 0.03           # 3% of equity per trade
     FEE_RATE            = 0.0004         # 0.04% taker fee each way
 
     # ── DRAWDOWN CIRCUIT BREAKER ─────────────────────────────────────────────
-    MAX_DRAWDOWN_PCT    = 0.20           # Kill switch at 20% drawdown
+    # Monthly Soft-Kill: Reduce size by 75% if MTD Drawdown > 20%
+    MONTH_MAX_DD_PCT    = 0.20
+    # Hard-Kill: Stop trading if Total Drawdown > 30%
+    MAX_DRAWDOWN_PCT    = 0.30
 
     # ── INITIAL CAPITAL ──────────────────────────────────────────────────────
     INITIAL_BALANCE     = 10000.0
