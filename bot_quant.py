@@ -187,7 +187,15 @@ class QuantBot:
                             "minQty": f["minQty"]
                         }
 
-        # Set leverage
+        # Set leverage and margin type
+        try:
+            self.client.futures_change_margin_type(
+                symbol=self.cfg.SYMBOL,
+                marginType="CROSSED"
+            )
+        except Exception:
+            pass # Already set
+
         self.client.futures_change_leverage(
             symbol=self.cfg.SYMBOL,
             leverage=self.cfg.LEVERAGE
@@ -216,11 +224,18 @@ class QuantBot:
         return df
 
     def get_balance(self):
-        balances = self.client.futures_account_balance()
-        for b in balances:
-            if b["asset"] == "USDT":
-                return float(b["balance"])
-        return 0.0
+        try:
+            balances = self.client.futures_account_balance()
+            for b in balances:
+                if b["asset"] == "USDT":
+                    total = float(b["balance"])
+                    avail = float(b["availableBalance"])
+                    log.info(f"Wallet: ${total:.2f} | Available: ${avail:.2f}")
+                    return avail
+            return 0.0
+        except Exception as e:
+            log.error(f"Error fetching balance: {e}")
+            return 0.0
 
     # ── Order Execution ───────────────────────────────────────────────────────
     def cancel_open_orders(self):
