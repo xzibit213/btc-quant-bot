@@ -88,6 +88,10 @@ class TradeState:
         self.trade_log      = deque(maxlen=500)
         self.peak_balance   = 0.0
         self.circuit_breaker = False
+        self.current_month   = ""
+        self.monthly_peak    = 0.0
+        self.reduction_factor = 1.0
+        self.starting_balance = 0.0
 
     def reset_daily(self, today):
         with self._lock:
@@ -118,18 +122,34 @@ class TradeState:
                 log.info(f"Trade closed: {result} | PnL: ${pnl:.2f}")
                 self.active_trade = None
 
-    def check_drawdown(self, balance, max_dd_pct):
+    def check_drawdown(self, balance, max_dd_pct, month_max_dd_pct):
         with self._lock:
+            # 1. Total Drawdown (Hard Circuit Breaker)
             self.peak_balance = max(self.peak_balance, balance)
             if self.peak_balance > 0:
-                dd = (self.peak_balance - balance) / self.peak_balance
-                if dd >= max_dd_pct:
-                    self.circuit_breaker = True
-                    log.warning(f"🚨 CIRCUIT BREAKER ACTIVATED — DD: {dd*100:.1f}%")
-                elif dd < max_dd_pct * 0.5:
+                total_dd = (self.peak_balance - balance) / self.peak_balance
+                if total_dd >= max_dd_pct:
+                    if not self.circuit_breaker:
+                        self.circuit_breaker = True
+                        log.warning(f"🚨 TOTAL CIRCUIT BREAKER ACTIVATED — DD: {total_dd*100:.1f}%")
+                elif total_dd < max_dd_pct * 0.5:
                     if self.circuit_breaker:
                         self.circuit_breaker = False
-                        log.info("Circuit breaker deactivated — drawdown recovered")
+                        log.info("Total circuit breaker deactivated — drawdown recovered")
+
+            # 2. Monthly Drawdown (Soft Reduction)
+            today = datetime.now(timezone.utc).strftime("%Y-%m")
+            if not hasattr(self, 'monthly_peak') or self.current_month != today:
+                self.current_month = today
+                self.monthly_peak = balance
+                log.info(f"Monthly drawdown tracker reset for {today}")
+            
+            self.monthly_peak = max(self.monthly_peak, balance)
+            monthly_dd = (self.monthly_peak - balance) / self.monthly_peak if self.monthly_peak > 0 else 0
+            self.reduction_factor = 0.25 if monthly_dd >= month_max_dd_pct else 1.0
+            
+            if self.reduction_factor < 1.0:
+                log.warning(f"⚠️ MONTHLY DRAWDOWN EXCEEDED ({monthly_dd*100:.1f}%) — SIZING REDUCED BY 75%")
 
     def get_log(self):
         with self._lock:
@@ -249,6 +269,21 @@ class QuantBot:
         except BinanceAPIException as e:
             log.warning(f"Failed to cancel open orders: {e}")
 
+    def get_open_orders(self):
+        """Fetch all open SL/TP orders from Binance."""
+        if not self.client: return []
+        try:
+            orders = self.client.futures_get_open_orders(symbol=self.cfg.SYMBOL)
+            return [{
+                "id": o["orderId"],
+                "type": o["type"],
+                "side": o["side"],
+                "price": o.get("stopPrice") or o["price"],
+                "time": datetime.fromtimestamp(o["time"]/1000, tz=timezone.utc).isoformat()
+            } for o in orders]
+        except Exception:
+            return []
+
     def place_order(self, direction, qty, entry, stop, take_profit):
         side       = "BUY"  if direction == "LONG"  else "SELL"
         close_side = "SELL" if direction == "LONG"  else "BUY"
@@ -327,7 +362,7 @@ class QuantBot:
 
         # Check circuit breaker
         balance = self.get_balance()
-        self.state.check_drawdown(balance, self.cfg.MAX_DRAWDOWN_PCT)
+        self.state.check_drawdown(balance, self.cfg.MAX_DRAWDOWN_PCT, self.cfg.MONTH_MAX_DD_PCT)
 
         if not self.state.can_take_signal(self.cfg.MAX_TRADES_PER_DAY):
             return
@@ -397,6 +432,9 @@ class QuantBot:
             entry, stop, vol_lev, close,
             self.symbol_info
         )
+        
+        # Apply Monthly Reduction Factor
+        qty *= self.state.reduction_factor
 
         if qty <= 0:
             log.warning("Position size = 0 — skipping")
@@ -404,8 +442,8 @@ class QuantBot:
 
         risk_usd = balance * self.cfg.RISK_PER_TRADE
         log.info(f"✅ SIGNAL | {direction} | Momentum={signal:.3f} | "
-                 f"VolLev={vol_lev:.2f}× | Entry≈${entry:.0f} | "
-                 f"SL=${stop:.0f} | TP=${tp:.0f} | Qty={qty} | Risk=${risk_usd:.2f}")
+                 f"VolLev={vol_lev:.2f}× | M_Sizing={self.state.reduction_factor:.2f} | "
+                 f"Entry≈${entry:.0f} | SL=${stop:.0f} | TP=${tp:.0f} | Qty={qty} | Risk=${risk_usd:.2f}")
 
         try:
             order_ids = self.place_order(direction, qty, entry, stop, tp)
@@ -467,6 +505,11 @@ class QuantBot:
             log.warning("Bot already running.")
             return
         self.connect()
+        # Initialize starting balance for ROI
+        if self.state.starting_balance == 0:
+            self.state.starting_balance = self.get_balance()
+            log.info(f"Starting balance recorded: ${self.state.starting_balance:.2f}")
+
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -481,6 +524,17 @@ class QuantBot:
     def status(self):
         now = datetime.now(timezone.utc)
         stats = self.state.get_stats()
+        
+        # Calculate ROI
+        balance = self.get_balance()
+        start_bal = self.state.starting_balance or balance
+        roi_pct = ((balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
+        
+        # Margin used
+        margin_used = 0.0
+        if self.state.active_trade:
+            margin_used = (self.state.active_trade['qty'] * self.state.active_trade['entry']) / self.cfg.LEVERAGE
+
         return {
             "running":           bool(self._running),
             "timestamp":         now.isoformat(),
@@ -491,6 +545,11 @@ class QuantBot:
             "last_regime_safe":  bool(self.last_regime),
             "last_vol_leverage": float(round(self.last_vol_lev, 3)),
             "last_realized_vol": float(round(self.last_realized_vol, 4)),
+            "reduction_factor":  self.state.reduction_factor,
+            "starting_balance":  round(start_bal, 2),
+            "roi_pct":           round(roi_pct, 2),
+            "margin_used":       round(margin_used, 2),
+            "open_orders":       self.get_open_orders(),
             "stats":             stats,
             "trade_log":         self.state.get_log()[:20],
         }
