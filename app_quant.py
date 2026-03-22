@@ -587,6 +587,10 @@ setInterval(fetchLog, 30000);
 
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
 @app.route("/")
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
