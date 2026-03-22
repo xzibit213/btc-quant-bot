@@ -45,7 +45,7 @@ class LiveConfig(StrategyConfig):
     TESTNET     = os.getenv("TESTNET", "true").lower() == "true"
 
     # Live overrides
-    LEVERAGE        = 1              # Keep at 1× — bot manages risk via sizing
+    LEVERAGE        = 10             # 10× leverage — bot manages actual risk via sizing
     EVAL_INTERVAL   = 60             # Check every 60 seconds
     CANDLE_LIMIT    = 500            # Bars to fetch for indicator computation
     DAILY_LIMIT     = 30             # Daily candles for trend bias
@@ -223,33 +223,85 @@ class QuantBot:
         return 0.0
 
     # ── Order Execution ───────────────────────────────────────────────────────
+    def cancel_open_orders(self):
+        """Cancel ALL open orders for the symbol to clean up orphaned SL/TP."""
+        try:
+            open_orders = self.client.futures_get_open_orders(symbol=self.cfg.SYMBOL)
+            if open_orders:
+                log.info(f"Cancelling {len(open_orders)} orphaned open order(s)...")
+                self.client.futures_cancel_all_open_orders(symbol=self.cfg.SYMBOL)
+                log.info("All open orders cancelled.")
+        except BinanceAPIException as e:
+            log.warning(f"Failed to cancel open orders: {e}")
+
     def place_order(self, direction, qty, entry, stop, take_profit):
         side       = "BUY"  if direction == "LONG"  else "SELL"
         close_side = "SELL" if direction == "LONG"  else "BUY"
 
         log.info(f"Placing {direction} | qty={qty} | SL=${stop:.0f} | TP=${take_profit:.0f}")
 
-        entry_order = self.client.futures_create_order(
-            symbol=self.cfg.SYMBOL,
-            side=side, type="MARKET", quantity=qty
-        )
-        sl_order = self.client.futures_create_order(
-            symbol=self.cfg.SYMBOL,
-            side=close_side, type="STOP_MARKET",
-            stopPrice=round(stop, 1),
-            closePosition=True, timeInForce="GTE_GTC"
-        )
-        tp_order = self.client.futures_create_order(
-            symbol=self.cfg.SYMBOL,
-            side=close_side, type="TAKE_PROFIT_MARKET",
-            stopPrice=round(take_profit, 1),
-            closePosition=True, timeInForce="GTE_GTC"
-        )
+        # Step 0: Cancel any orphaned open orders (fixes -4130 error)
+        self.cancel_open_orders()
+
+        # Step 1: Place entry order
+        try:
+            entry_order = self.client.futures_create_order(
+                symbol=self.cfg.SYMBOL,
+                side=side, type="MARKET", quantity=qty
+            )
+        except BinanceAPIException as e:
+            log.error(f"Entry order failed: {e}")
+            raise  # Propagate — no cleanup needed
+
+        entry_id = entry_order.get("orderId", "unknown")
+
+        # Step 2: Place SL order
+        sl_id = None
+        try:
+            sl_order = self.client.futures_create_order(
+                symbol=self.cfg.SYMBOL,
+                side=close_side, type="STOP_MARKET",
+                stopPrice=round(stop, 1),
+                closePosition=True, timeInForce="GTE_GTC"
+            )
+            sl_id = sl_order.get("orderId", "unknown")
+        except BinanceAPIException as e:
+            log.error(f"SL order failed: {e} — closing position to rollback")
+            try:
+                self.client.futures_create_order(
+                    symbol=self.cfg.SYMBOL,
+                    side=close_side, type="MARKET", quantity=qty
+                )
+            except Exception:
+                log.error("Rollback close also failed!")
+            raise
+
+        # Step 3: Place TP order
+        tp_id = None
+        try:
+            tp_order = self.client.futures_create_order(
+                symbol=self.cfg.SYMBOL,
+                side=close_side, type="TAKE_PROFIT_MARKET",
+                stopPrice=round(take_profit, 1),
+                closePosition=True, timeInForce="GTE_GTC"
+            )
+            tp_id = tp_order.get("orderId", "unknown")
+        except BinanceAPIException as e:
+            log.error(f"TP order failed: {e} — closing position to rollback")
+            try:
+                self.cancel_open_orders()
+                self.client.futures_create_order(
+                    symbol=self.cfg.SYMBOL,
+                    side=close_side, type="MARKET", quantity=qty
+                )
+            except Exception:
+                log.error("Rollback close also failed!")
+            raise
 
         return {
-            "entry_id": entry_order["orderId"],
-            "sl_id": sl_order["orderId"],
-            "tp_id": tp_order["orderId"],
+            "entry_id": entry_id,
+            "sl_id": sl_id,
+            "tp_id": tp_id,
         }
 
     # ── Signal Evaluation ─────────────────────────────────────────────────────
