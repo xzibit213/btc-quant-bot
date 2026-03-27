@@ -129,13 +129,13 @@ class QuantBot:
         log.info(f"Placing SL @ ${stop:.1f} and TP @ ${tp:.1f}...")
         sl_order = self.client.futures_create_order(
             symbol=self.cfg.SYMBOL, side=close_side, type="STOP_MARKET", 
-            stopPrice=round(stop, 1), closePosition=True, timeInForce="GTE_GTC"
+            stopPrice=round(stop, 1), quantity=qty, reduceOnly=True
         )
         tp_order = self.client.futures_create_order(
             symbol=self.cfg.SYMBOL, side=close_side, type="TAKE_PROFIT_MARKET", 
-            stopPrice=round(tp, 1), closePosition=True, timeInForce="GTE_GTC"
+            stopPrice=round(tp, 1), quantity=qty, reduceOnly=True
         )
-        return {"entry_id": entry_order["orderId"], "sl_id": sl_order["orderId"], "tp_id": tp_order["orderId"]}
+        return {"entry_id": entry_order.get("orderId"), "sl_id": sl_order.get("orderId"), "tp_id": tp_order.get("orderId")}
 
     def evaluate(self):
         balance = self.get_balance()
