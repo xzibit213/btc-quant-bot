@@ -227,6 +227,7 @@ class QuantBot:
             log.error(f"Position monitor error: {e}")
 
     def start(self):
+        if self._running: return
         self.connect()
         self._running = True
         def loop():
@@ -236,7 +237,12 @@ class QuantBot:
                     self.monitor_positions()
                 except Exception as e: log.error(f"Error: {e}")
                 time.sleep(60)
-        threading.Thread(target=loop, daemon=True).start()
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        log.info("Bot manually halted.")
 
     def status(self):
         return {"running": self._running, "active": self.state.active_trade, "log": list(self.state.trade_log)}
