@@ -211,7 +211,7 @@ class QuantBot:
         try:
             self.client.futures_change_margin_type(
                 symbol=self.cfg.SYMBOL,
-                marginType="CROSSED"
+                marginType="ISOLATED"
             )
         except Exception:
             pass # Already set
@@ -312,7 +312,7 @@ class QuantBot:
                 symbol=self.cfg.SYMBOL,
                 side=close_side, type="STOP_MARKET",
                 stopPrice=round(stop, 1),
-                quantity=qty, reduceOnly=True
+                closePosition=True
             )
             sl_id = sl_order.get("orderId", "unknown")
         except BinanceAPIException as e:
@@ -333,7 +333,7 @@ class QuantBot:
                 symbol=self.cfg.SYMBOL,
                 side=close_side, type="TAKE_PROFIT_MARKET",
                 stopPrice=round(take_profit, 1),
-                quantity=qty, reduceOnly=True
+                closePosition=True
             )
             tp_id = tp_order.get("orderId", "unknown")
         except BinanceAPIException as e:
