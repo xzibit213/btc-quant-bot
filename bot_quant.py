@@ -344,9 +344,7 @@ class QuantBot:
         
         sl_id, tp_id = None, None
         try:
-            # Requires python-binance >= 1.0.16
-            import json
-            batch_res = self.client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+            batch_res = self.client.futures_place_batch_order(batchOrders=batch_payload)
             
             # Parse the batch response
             for res in batch_res:
