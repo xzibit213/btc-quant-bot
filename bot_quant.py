@@ -43,6 +43,7 @@ class LiveConfig(StrategyConfig):
     API_KEY     = os.getenv("BINANCE_API_KEY", "")
     API_SECRET  = os.getenv("BINANCE_API_SECRET", "")
     TESTNET     = os.getenv("TESTNET", "true").lower() == "true"
+    PAPER_TRADE = os.getenv("PAPER_TRADE", "true").lower() == "true"  # Set to false to use real/testnet money
 
     # Live overrides
     LEVERAGE        = 5              # 5× leverage cap
@@ -344,6 +345,7 @@ class QuantBot:
         
         sl_id, tp_id = None, None
         try:
+            # Replaced json.dumps: internal python-binance library expects a raw list
             batch_res = self.client.futures_place_batch_order(batchOrders=batch_payload)
             
             # Parse the batch response
@@ -471,12 +473,18 @@ class QuantBot:
             return
 
         risk_usd = balance * self.cfg.RISK_PER_TRADE
-        log.info(f"✅ SIGNAL | {direction} | Momentum={signal:.3f} | "
+        log.info(f"{'🧪 PAPER SIGNAL' if self.cfg.PAPER_TRADE else '✅ LIVE SIGNAL'} | {direction} | Momentum={signal:.3f} | "
                  f"VolLev={vol_lev:.2f}× | M_Sizing={self.state.reduction_factor:.2f} | "
                  f"Entry≈${entry:.0f} | SL=${stop:.0f} | TP=${tp:.0f} | Qty={qty} | Risk=${risk_usd:.2f}")
 
         try:
-            order_ids = self.place_order(direction, qty, entry, stop, tp)
+            if self.cfg.PAPER_TRADE:
+                # Bypass API and simulate order placement securely
+                order_ids = {"entry_id": f"paper_{int(time.time())}", "sl_id": "paper_sl", "tp_id": "paper_tp"}
+                log.info("PAPER TRADE MODE ACTIVE: Ignored live exchange execution.")
+            else:
+                order_ids = self.place_order(direction, qty, entry, stop, tp)
+                
             self.state.open_trade({
                 "id": order_ids["entry_id"],
                 "direction": direction,
@@ -491,6 +499,7 @@ class QuantBot:
                 "opened_at": now.isoformat(),
                 "result": "OPEN",
                 "pnl": 0.0,
+                "is_paper": self.cfg.PAPER_TRADE,
                 **order_ids
             })
         except BinanceAPIException as e:
@@ -519,6 +528,27 @@ class QuantBot:
                 return
 
         try:
+            # Paper trade check: don't query the exchange
+            if trade.get("is_paper"):
+                try:
+                    ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
+                    mark_price = float(ticker["markPrice"])
+                except:
+                    return # Skip if network fails
+                    
+                direction = trade["direction"]
+                sl = trade["stop"]
+                tp = trade["take_profit"]
+                
+                # Check for virtual SL or TP hit
+                if (direction == "LONG" and (mark_price <= sl or mark_price >= tp)) or \
+                   (direction == "SHORT" and (mark_price >= sl or mark_price <= tp)):
+                    pnl = (mark_price - trade["entry"]) * trade["qty"] if direction == "LONG" else (trade["entry"] - mark_price) * trade["qty"]
+                    result = "WIN" if pnl > 0 else "LOSS"
+                    self.state.close_trade(result, pnl)
+                    log.info(f"[PAPER TRADE SIMULATION] Position Virtually Closed.")
+                return
+
             positions = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
             for pos in positions:
                 if pos["symbol"] == self.cfg.SYMBOL:
