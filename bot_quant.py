@@ -178,6 +178,7 @@ class QuantBot:
         self._running = False
         self._thread  = None
         self.symbol_info = {}
+        self._last_fail_time = None  # Cooldown after failed trade attempt
 
         # Cached regime/signal state for dashboard
         self.last_signal    = 0.0
@@ -244,6 +245,8 @@ class QuantBot:
         return df
 
     def get_balance(self):
+        if not self.client:
+            return 0.0
         try:
             balances = self.client.futures_account_balance()
             for b in balances:
@@ -304,6 +307,57 @@ class QuantBot:
             raise  # Propagate — no cleanup needed
 
         entry_id = entry_order.get("orderId", "unknown")
+
+        # Step 1b: Get ACTUAL fill price from Binance (not stale candle close)
+        actual_entry = entry  # fallback
+        try:
+            pos_info = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
+            for p in pos_info:
+                if p["symbol"] == self.cfg.SYMBOL and abs(float(p["positionAmt"])) > 0:
+                    actual_entry = float(p["entryPrice"])
+                    break
+        except Exception:
+            pass  # Use original entry as fallback
+
+        # Step 1c: Recalculate SL/TP based on actual fill price
+        stop_distance = abs(entry - stop)
+        tp_distance = abs(entry - take_profit)
+        if direction == "LONG":
+            stop = actual_entry - stop_distance
+            take_profit = actual_entry + tp_distance
+        else:
+            stop = actual_entry + stop_distance
+            take_profit = actual_entry - tp_distance
+
+        log.info(f"Actual fill ≈ ${actual_entry:.1f} | Adjusted SL=${stop:.1f} | TP=${take_profit:.1f}")
+
+        # Step 1d: Get current mark price to validate SL/TP
+        try:
+            ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
+            mark_price = float(ticker["markPrice"])
+        except Exception:
+            mark_price = actual_entry  # fallback
+
+        # Step 1e: Validate SL won't immediately trigger
+        sl_valid = True
+        if direction == "LONG" and stop >= mark_price:
+            log.error(f"SL ${stop:.1f} >= mark ${mark_price:.1f} — would trigger immediately, aborting")
+            sl_valid = False
+        elif direction == "SHORT" and stop <= mark_price:
+            log.error(f"SL ${stop:.1f} <= mark ${mark_price:.1f} — would trigger immediately, aborting")
+            sl_valid = False
+
+        if not sl_valid:
+            # Close the position we just opened
+            try:
+                self.client.futures_create_order(
+                    symbol=self.cfg.SYMBOL,
+                    side=close_side, type="MARKET", quantity=qty
+                )
+                log.info("Position closed — SL was invalid")
+            except Exception:
+                log.error("Failed to close position after invalid SL!")
+            raise BinanceAPIException(None, 400, '{"code":-2021,"msg":"SL would immediately trigger"}')
 
         # Step 2: Place SL order
         sl_id = None
@@ -366,6 +420,15 @@ class QuantBot:
 
         if not self.state.can_take_signal(self.cfg.MAX_TRADES_PER_DAY):
             return
+
+        # Check cooldown after failed trade (15 minutes)
+        if self._last_fail_time:
+            elapsed = (now - self._last_fail_time).total_seconds()
+            if elapsed < 900:  # 15 minutes
+                return
+            else:
+                self._last_fail_time = None
+                log.info("Cooldown expired — resuming signal evaluation")
 
         # Fetch data and compute indicators
         df = self.fetch_ohlcv(limit=self.cfg.CANDLE_LIMIT)
@@ -465,6 +528,9 @@ class QuantBot:
             })
         except BinanceAPIException as e:
             log.error(f"Order failed: {e}")
+            # Cooldown: don't retry for 15 minutes after a failure
+            self._last_fail_time = datetime.now(timezone.utc)
+            log.warning("⏸️ 15-minute cooldown activated after failed trade")
 
     # ── Position Monitor ──────────────────────────────────────────────────────
     def monitor_positions(self):
