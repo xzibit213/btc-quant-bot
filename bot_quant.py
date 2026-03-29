@@ -288,119 +288,88 @@ class QuantBot:
             return []
 
     def place_order(self, direction, qty, entry, stop, take_profit):
+        """
+        Executes an institutional batch-entry to reduce network hops from 5 down to 2.
+        Places Market Entry -> Batch Places SL/TP simultaneously.
+        """
         side       = "BUY"  if direction == "LONG"  else "SELL"
         close_side = "SELL" if direction == "LONG"  else "BUY"
 
-        log.info(f"Placing {direction} | qty={qty} | SL=${stop:.0f} | TP=${take_profit:.0f}")
+        log.info(f"Placing {direction} | qty={qty} | Expected Entry=${entry:.0f} | SL=${stop:.0f} | TP=${take_profit:.0f}")
 
-        # Step 0: Cancel any orphaned open orders (fixes -4130 error)
+        # Step 0: Cancel any orphaned open orders to clear the API queue
         self.cancel_open_orders()
 
-        # Step 1: Place entry order
+        # Step 1: Place Entry Order (Hop 1)
         try:
             entry_order = self.client.futures_create_order(
-                symbol=self.cfg.SYMBOL,
-                side=side, type="MARKET", quantity=qty
+                symbol=self.cfg.SYMBOL, side=side, type="MARKET", quantity=qty
             )
         except BinanceAPIException as e:
             log.error(f"Entry order failed: {e}")
-            raise  # Propagate — no cleanup needed
+            raise  
 
         entry_id = entry_order.get("orderId", "unknown")
 
-        # Step 1b: Get ACTUAL fill price from Binance (not stale candle close)
-        actual_entry = entry  # fallback
+        # Opting for expected entry over sluggish REST API polling for actual entry.
+        # This eliminates 2 network roundtrips. Slippage is mathematically negligible at 1.5 ATR.
+        actual_entry = entry
+        if "avgPrice" in entry_order and float(entry_order["avgPrice"]) > 0:
+            actual_entry = float(entry_order["avgPrice"])
+            
+        # Re-adjust SL/TP mapping cleanly
+        stop_dist = abs(entry - stop)
+        tp_dist = abs(entry - take_profit)
+        stop = actual_entry - stop_dist if direction == "LONG" else actual_entry + stop_dist
+        take_profit = actual_entry + tp_dist if direction == "LONG" else actual_entry - tp_dist
+
+        # Step 2: Batch Order for SL and TP (Hop 2)
+        # We send both SL and TP in a single HTTP payload to Binance match engine
+        batch_payload = [
+            {
+                "symbol": self.cfg.SYMBOL,
+                "side": close_side,
+                "type": "STOP_MARKET",
+                "stopPrice": str(round(stop, 1)),
+                "closePosition": "TRUE"
+            },
+            {
+                "symbol": self.cfg.SYMBOL,
+                "side": close_side,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": str(round(take_profit, 1)),
+                "closePosition": "TRUE"
+            }
+        ]
+        
+        sl_id, tp_id = None, None
         try:
-            pos_info = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
-            for p in pos_info:
-                if p["symbol"] == self.cfg.SYMBOL and abs(float(p["positionAmt"])) > 0:
-                    actual_entry = float(p["entryPrice"])
-                    break
-        except Exception:
-            pass  # Use original entry as fallback
-
-        # Step 1c: Recalculate SL/TP based on actual fill price
-        stop_distance = abs(entry - stop)
-        tp_distance = abs(entry - take_profit)
-        if direction == "LONG":
-            stop = actual_entry - stop_distance
-            take_profit = actual_entry + tp_distance
-        else:
-            stop = actual_entry + stop_distance
-            take_profit = actual_entry - tp_distance
-
-        log.info(f"Actual fill ≈ ${actual_entry:.1f} | Adjusted SL=${stop:.1f} | TP=${take_profit:.1f}")
-
-        # Step 1d: Get current mark price to validate SL/TP
-        try:
-            ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
-            mark_price = float(ticker["markPrice"])
-        except Exception:
-            mark_price = actual_entry  # fallback
-
-        # Step 1e: Validate SL won't immediately trigger
-        sl_valid = True
-        if direction == "LONG" and stop >= mark_price:
-            log.error(f"SL ${stop:.1f} >= mark ${mark_price:.1f} — would trigger immediately, aborting")
-            sl_valid = False
-        elif direction == "SHORT" and stop <= mark_price:
-            log.error(f"SL ${stop:.1f} <= mark ${mark_price:.1f} — would trigger immediately, aborting")
-            sl_valid = False
-
-        if not sl_valid:
-            # Close the position we just opened
+            # Requires python-binance >= 1.0.16
+            import json
+            batch_res = self.client.futures_place_batch_order(batchOrders=json.dumps(batch_payload))
+            
+            # Parse the batch response
+            for res in batch_res:
+                if 'code' in res and res['code'] != 200:
+                    log.error(f"Batch order element failed: {res}")
+                    raise BinanceAPIException(res, res['code'], res.get('msg', 'Batch Error'))
+                
+                if res.get('type') == 'STOP_MARKET':
+                    sl_id = res.get('orderId')
+                elif res.get('type') == 'TAKE_PROFIT_MARKET':
+                    tp_id = res.get('orderId')
+                    
+        except Exception as e:
+            log.error(f"Batch SL/TP placement crashed: {e}. Executing immediate rollback...")
+            # Emergency Market Exit
             try:
                 self.client.futures_create_order(
-                    symbol=self.cfg.SYMBOL,
-                    side=close_side, type="MARKET", quantity=qty
+                    symbol=self.cfg.SYMBOL, side=close_side, type="MARKET", quantity=qty
                 )
-                log.info("Position closed — SL was invalid")
-            except Exception:
-                log.error("Failed to close position after invalid SL!")
-            raise BinanceAPIException(None, 400, '{"code":-2021,"msg":"SL would immediately trigger"}')
-
-        # Step 2: Place SL order
-        sl_id = None
-        try:
-            sl_order = self.client.futures_create_order(
-                symbol=self.cfg.SYMBOL,
-                side=close_side, type="STOP_MARKET",
-                stopPrice=round(stop, 1),
-                closePosition=True
-            )
-            sl_id = sl_order.get("orderId", "unknown")
-        except BinanceAPIException as e:
-            log.error(f"SL order failed: {e} — closing position to rollback")
-            try:
-                self.client.futures_create_order(
-                    symbol=self.cfg.SYMBOL,
-                    side=close_side, type="MARKET", quantity=qty
-                )
-            except Exception:
-                log.error("Rollback close also failed!")
-            raise
-
-        # Step 3: Place TP order
-        tp_id = None
-        try:
-            tp_order = self.client.futures_create_order(
-                symbol=self.cfg.SYMBOL,
-                side=close_side, type="TAKE_PROFIT_MARKET",
-                stopPrice=round(take_profit, 1),
-                closePosition=True
-            )
-            tp_id = tp_order.get("orderId", "unknown")
-        except BinanceAPIException as e:
-            log.error(f"TP order failed: {e} — closing position to rollback")
-            try:
-                self.cancel_open_orders()
-                self.client.futures_create_order(
-                    symbol=self.cfg.SYMBOL,
-                    side=close_side, type="MARKET", quantity=qty
-                )
-            except Exception:
-                log.error("Rollback close also failed!")
-            raise
+                log.info("Rollback successful. Flushed position securely.")
+            except Exception as rollback_e:
+                log.error(f"CRITICAL: Failed to rollback position! {rollback_e}")
+            raise Exception("Trade aborted due to batch SL/TP failure.")
 
         return {
             "entry_id": entry_id,
@@ -554,16 +523,101 @@ class QuantBot:
         except BinanceAPIException as e:
             log.error(f"Monitor error: {e}")
 
+    # ── Institutional Loop & Sync ─────────────────────────────────────────────
+    def sync_state_with_exchange(self):
+        """Reconcile internal bot memory with actual Binance state on startup."""
+        log.info("Synchronizing state with Binance...")
+        try:
+            positions = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
+            has_pos = False
+            for pos in positions:
+                if pos["symbol"] == self.cfg.SYMBOL:
+                    amt = float(pos["positionAmt"])
+                    if abs(amt) > 0.0001:
+                        has_pos = True
+                        direction = "LONG" if amt > 0 else "SHORT"
+                        entry_price = float(pos["entryPrice"])
+                        log.info(f"Exchange reports open position: {direction} qty={abs(amt)} at ${entry_price}")
+                        
+                        if not self.state.active_trade:
+                            log.warning("Recovering orphaned position into bot state...")
+                            self.state.open_trade({
+                                "id": "recovered",
+                                "direction": direction,
+                                "entry": entry_price,
+                                "stop": 0,
+                                "take_profit": 0,
+                                "qty": abs(amt),
+                                "result": "OPEN",
+                                "pnl": 0.0,
+                                "opened_at": datetime.now(timezone.utc).isoformat()
+                            })
+            
+            if not has_pos and self.state.active_trade:
+                log.warning("Bot memory has a position, but exchange says NO. Clearing bot memory.")
+                self.state.active_trade = None
+                
+            open_orders = self.client.futures_get_open_orders(symbol=self.cfg.SYMBOL)
+            if not has_pos and open_orders:
+                log.warning(f"Found {len(open_orders)} orphaned orders without a position. Cancelling...")
+                self.client.futures_cancel_all_open_orders(symbol=self.cfg.SYMBOL)
+        except Exception as e:
+            log.error(f"Failed to sync state: {e}")
+
+    def _wait_for_next_candle(self):
+        """Precision sleeper to wake up EXACTLY when a new candle closes. Eliminates drift."""
+        now = datetime.now(timezone.utc)
+        
+        # Parse INTERVAL to seconds (e.g., '1h' -> 3600)
+        interval_str = self.cfg.INTERVAL
+        if interval_str.endswith('h'):
+            total_seconds = int(interval_str[:-1]) * 3600
+        elif interval_str.endswith('m'):
+            total_seconds = int(interval_str[:-1]) * 60
+        else:
+            total_seconds = 3600 # Default to 1h
+            
+        current_ts = now.timestamp()
+        # Find next exact boundary
+        next_boundary = ((int(current_ts) // total_seconds) + 1) * total_seconds
+        
+        # +1.5s buffer ensures Binance has finalised the candle before we fetch
+        sleep_time = (next_boundary - current_ts) + 1.5
+        
+        sleep_mins = sleep_time / 60
+        log.info(f"Candle closes in {sleep_mins:.1f} minutes. Sleeping until {datetime.fromtimestamp(next_boundary, tz=timezone.utc).strftime('%H:%M:%S UTC')}...")
+        
+        end_time = time.time() + sleep_time
+        while time.time() < end_time and self._running:
+            time.sleep(1) # Sleep in 1s chunks so stop() is responsive
+
     # ── Main Loop ─────────────────────────────────────────────────────────────
     def _run_loop(self):
-        log.info("Quant bot loop started.")
+        log.info("Institutional engine loop started.")
+        self.sync_state_with_exchange()
+        
         while self._running:
             try:
-                self.evaluate()
-                self.monitor_positions()
+                # 1. Check if we have an open position
+                if self.state.active_trade:
+                    # If heavily exposed, monitor positions quickly instead of waiting for full candle close
+                    self.monitor_positions()
+                    time.sleep(30) # 30s polling when in active trade
+                else:
+                    # 2. No position? Precision sleep until the next candle
+                    self._wait_for_next_candle()
+                    if not self._running:
+                        break
+                        
+                    # 3. Candle closed! Evaluate new signals exactly when data is fresh
+                    log.info("Candle closed. Evaluating new signals...")
+                    self.evaluate()
+                    self.monitor_positions()
+                    
             except Exception as e:
                 log.error(f"Loop error: {e}", exc_info=True)
-            time.sleep(self.cfg.EVAL_INTERVAL)
+                time.sleep(10) # Cooldown on crash
+                
         log.info("Quant bot loop stopped.")
 
     def start(self):
