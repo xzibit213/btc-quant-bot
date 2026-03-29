@@ -506,12 +506,27 @@ class QuantBot:
         trade = self.state.active_trade
         if not trade:
             return
+            
+        # 1. LATENCY GUARD: Prevent ghosting trades due to Binance Read-Replica Lag
+        opened_at_str = trade.get("opened_at")
+        if opened_at_str:
+            # Parse handle Python 3.11+ isoformat w/ or w/o Z
+            if opened_at_str.endswith("Z"): opened_at_str = opened_at_str[:-1] + "+00:00"
+            opened_at = datetime.fromisoformat(opened_at_str)
+            
+            # If the trade was opened less than 15 seconds ago, the REST API position endpoint 
+            # might still return positionAmt = 0.0 because it's accessing a delayed database replica.
+            if (datetime.now(timezone.utc) - opened_at).total_seconds() < 15:
+                # Safely ignore checking to prevent premature local memory wiping
+                return
+
         try:
             positions = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
             for pos in positions:
                 if pos["symbol"] == self.cfg.SYMBOL:
                     amt = float(pos["positionAmt"])
                     if abs(amt) < 0.0001:
+                        # Position is genuinely closed
                         entry_price = float(pos.get("entryPrice", trade["entry"]))
                         mark_price  = float(pos.get("markPrice",  trade["entry"]))
                         direction   = trade["direction"]
