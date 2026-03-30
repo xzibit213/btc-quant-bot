@@ -337,6 +337,22 @@ class QuantBot:
         }
 
     # ── Signal Evaluation ─────────────────────────────────────────────────────
+    def update_dashboard_stats(self):
+        """Background process to feed the UI with live incoming stats on the unclosed candle."""
+        if not self._running: return
+        try:
+            df = self.fetch_ohlcv(limit=self.cfg.CANDLE_LIMIT)
+            if df.empty: return
+            
+            # Using -1 (the LIVE unclosed candle) for the dashboard UI
+            latest = df.iloc[-1]
+            self.last_signal = float(latest['momentum_signal']) if not np.isnan(latest['momentum_signal']) else 0.0
+            self.last_regime = bool(latest['regime_safe'] == 1)
+            self.last_vol_lev = float(latest['vol_leverage']) if not np.isnan(latest['vol_leverage']) else 1.0
+            self.last_realized_vol = float(latest['realized_vol']) if not np.isnan(latest['realized_vol']) else 0.0
+        except Exception:
+            pass # Fails silently in background
+
     def evaluate(self):
         now = datetime.now(timezone.utc)
         today = now.strftime("%Y-%m-%d")
@@ -627,19 +643,25 @@ class QuantBot:
         log.info(f"Candle closes in {sleep_mins:.1f} minutes. Sleeping until {datetime.fromtimestamp(next_boundary, tz=timezone.utc).strftime('%H:%M:%S UTC')}...")
         
         end_time = time.time() + sleep_time
+        last_stat_update = 0
         while time.time() < end_time and self._running:
+            if time.time() - last_stat_update >= 60:
+                self.update_dashboard_stats()
+                last_stat_update = time.time()
             time.sleep(1) # Sleep in 1s chunks so stop() is responsive
 
     # ── Main Loop ─────────────────────────────────────────────────────────────
     def _run_loop(self):
         log.info("Institutional engine loop started.")
         self.sync_state_with_exchange()
+        self.update_dashboard_stats() # Initialize dashboard instantly
         
         while self._running:
             try:
                 # 1. Check if we have an open position
                 if self.state.active_trade:
                     # If heavily exposed, monitor positions quickly instead of waiting for full candle close
+                    self.update_dashboard_stats()
                     self.monitor_positions()
                     time.sleep(30) # 30s polling when in active trade
                 else:
