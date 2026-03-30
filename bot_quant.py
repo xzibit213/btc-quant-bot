@@ -340,8 +340,8 @@ class QuantBot:
         today = now.strftime("%Y-%m-%d")
         self.state.reset_daily(today)
 
-        # Check circuit breaker
-        balance = self.get_balance()
+        # Always forcefully pull fresh balance directly from exchange to guarantee accurate position sizing
+        balance = self.get_balance(force_fetch=True)
         self.state.check_drawdown(balance, self.cfg.MAX_DRAWDOWN_PCT, self.cfg.MONTH_MAX_DD_PCT)
 
         if not self.state.can_take_signal(self.cfg.MAX_TRADES_PER_DAY):
@@ -396,7 +396,10 @@ class QuantBot:
                     self.client.futures_create_order(
                         symbol=self.cfg.SYMBOL, side=close_side, type="MARKET", quantity=active["qty"]
                     )
-                self.state.close_trade("REVERSAL", 0.0)
+                # Compute and record accurate PnL dynamically
+                pnl = (close - active["entry"]) * active["qty"] if active["direction"] == "LONG" else (active["entry"] - close) * active["qty"]
+                res = "WIN" if pnl > 0 else "LOSS"
+                self.state.close_trade(res, pnl)
             except Exception as e:
                 log.error(f"Failed to close reversed trade: {e}")
                 return
@@ -514,16 +517,9 @@ class QuantBot:
                     return # Skip if network fails
                     
                 direction = trade["direction"]
-                sl = trade["stop"]
-                tp = trade["take_profit"]
-                
-                # Check for virtual SL or TP hit
-                if (direction == "LONG" and (mark_price <= sl or mark_price >= tp)) or \
-                   (direction == "SHORT" and (mark_price >= sl or mark_price <= tp)):
-                    pnl = (mark_price - trade["entry"]) * trade["qty"] if direction == "LONG" else (trade["entry"] - mark_price) * trade["qty"]
-                    result = "WIN" if pnl > 0 else "LOSS"
-                    self.state.close_trade(result, pnl)
-                    log.info(f"[PAPER TRADE SIMULATION] Position Virtually Closed.")
+
+                # We no longer simulate virtual SL or TP hits cleanly mimicking logic. 
+                # Paper trades will now rigorously evaluate on direct reversals just like LIVE.
                 return
 
             positions = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
