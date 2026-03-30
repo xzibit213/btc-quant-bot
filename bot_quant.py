@@ -185,6 +185,12 @@ class QuantBot:
         self.last_regime    = True
         self.last_vol_lev   = 1.0
         self.last_realized_vol = 0.0
+        
+        # API request caching to prevent rate-limit drain from dashboard
+        self._cached_balance = 0.0
+        self._last_balance_time = 0
+        self._cached_orders = []
+        self._last_orders_time = 0
 
     # ── Connection ────────────────────────────────────────────────────────────
     def connect(self):
@@ -244,21 +250,27 @@ class QuantBot:
         df = compute_indicators(df, self.cfg)
         return df
 
-    def get_balance(self):
+    def get_balance(self, force_fetch=False):
         if not self.client:
             return 0.0
+            
+        now = time.time()
+        # Return cached balance if fetched within the last 60 seconds unless forced
+        if not force_fetch and (now - self._last_balance_time) < 60:
+            return self._cached_balance
+
         try:
             balances = self.client.futures_account_balance()
             for b in balances:
                 if b["asset"] == "USDT":
-                    total = float(b["balance"])
                     avail = float(b["availableBalance"])
-                    log.info(f"Wallet: ${total:.2f} | Available: ${avail:.2f}")
+                    self._cached_balance = avail
+                    self._last_balance_time = now
                     return avail
             return 0.0
         except Exception as e:
             log.error(f"Error fetching balance: {e}")
-            return 0.0
+            return self._cached_balance
 
     # ── Order Execution ───────────────────────────────────────────────────────
     def cancel_open_orders(self):
@@ -272,20 +284,30 @@ class QuantBot:
         except BinanceAPIException as e:
             log.warning(f"Failed to cancel open orders: {e}")
 
-    def get_open_orders(self):
-        """Fetch all open SL/TP orders from Binance."""
+    def get_open_orders(self, force_fetch=False):
+        """Fetch all open orders from Binance with caching to avoid rate limits."""
         if not self.client: return []
+        
+        now = time.time()
+        # Cache orders for 60 seconds
+        if not force_fetch and (now - self._last_orders_time) < 60:
+            return self._cached_orders
+            
         try:
             orders = self.client.futures_get_open_orders(symbol=self.cfg.SYMBOL)
-            return [{
+            parsed = [{
                 "id": o["orderId"],
                 "type": o["type"],
                 "side": o["side"],
                 "price": o.get("stopPrice") or o["price"],
                 "time": datetime.fromtimestamp(o["time"]/1000, tz=timezone.utc).isoformat()
             } for o in orders]
+            
+            self._cached_orders = parsed
+            self._last_orders_time = now
+            return parsed
         except Exception:
-            return []
+            return self._cached_orders
 
     def place_order(self, direction, qty, entry, stop, take_profit):
         """
