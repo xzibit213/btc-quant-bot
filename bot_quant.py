@@ -259,13 +259,14 @@ class QuantBot:
         if not force_fetch and (now - self._last_balance_time) < 60:
             return self._cached_balance
 
+        # Set timestamp immediately so network errors still trigger the 60s cooldown
+        self._last_balance_time = now
         try:
             balances = self.client.futures_account_balance()
             for b in balances:
                 if b["asset"] == "USDT":
                     avail = float(b["availableBalance"])
                     self._cached_balance = avail
-                    self._last_balance_time = now
                     return avail
             return 0.0
         except Exception as e:
@@ -293,6 +294,8 @@ class QuantBot:
         if not force_fetch and (now - self._last_orders_time) < 60:
             return self._cached_orders
             
+        # Set timestamp immediately so network errors still trigger the 60s cooldown
+        self._last_orders_time = now
         try:
             orders = self.client.futures_get_open_orders(symbol=self.cfg.SYMBOL)
             parsed = [{
@@ -304,7 +307,6 @@ class QuantBot:
             } for o in orders]
             
             self._cached_orders = parsed
-            self._last_orders_time = now
             return parsed
         except Exception:
             return self._cached_orders
