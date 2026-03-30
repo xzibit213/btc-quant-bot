@@ -103,8 +103,7 @@ class TradeState:
 
     def can_take_signal(self, max_signals):
         with self._lock:
-            return (self.active_trade is None
-                    and self.signals_today < max_signals
+            return (self.signals_today < max_signals
                     and not self.circuit_breaker)
 
     def open_trade(self, trade):
@@ -290,18 +289,13 @@ class QuantBot:
 
     def place_order(self, direction, qty, entry, stop, take_profit):
         """
-        Executes an institutional batch-entry to reduce network hops from 5 down to 2.
-        Places Market Entry -> Batch Places SL/TP simultaneously.
+        Executes an institutional entry (Market only, as requested).
         """
-        side       = "BUY"  if direction == "LONG"  else "SELL"
-        close_side = "SELL" if direction == "LONG"  else "BUY"
+        side = "BUY"  if direction == "LONG"  else "SELL"
 
-        log.info(f"Placing {direction} | qty={qty} | Expected Entry=${entry:.0f} | SL=${stop:.0f} | TP=${take_profit:.0f}")
+        log.info(f"Placing {direction} | qty={qty} | Expected Entry=${entry:.0f}")
 
-        # Step 0: Cancel any orphaned open orders to clear the API queue
-        self.cancel_open_orders()
-
-        # Step 1: Place Entry Order (Hop 1)
+        # Step 1: Place Entry Order
         try:
             entry_order = self.client.futures_create_order(
                 symbol=self.cfg.SYMBOL, side=side, type="MARKET", quantity=qty
@@ -312,69 +306,10 @@ class QuantBot:
 
         entry_id = entry_order.get("orderId", "unknown")
 
-        # Opting for expected entry over sluggish REST API polling for actual entry.
-        # This eliminates 2 network roundtrips. Slippage is mathematically negligible at 1.5 ATR.
-        actual_entry = entry
-        if "avgPrice" in entry_order and float(entry_order["avgPrice"]) > 0:
-            actual_entry = float(entry_order["avgPrice"])
-            
-        # Re-adjust SL/TP mapping cleanly
-        stop_dist = abs(entry - stop)
-        tp_dist = abs(entry - take_profit)
-        stop = actual_entry - stop_dist if direction == "LONG" else actual_entry + stop_dist
-        take_profit = actual_entry + tp_dist if direction == "LONG" else actual_entry - tp_dist
-
-        # Step 2: Batch Order for SL and TP (Hop 2)
-        # We send both SL and TP in a single HTTP payload to Binance match engine
-        batch_payload = [
-            {
-                "symbol": self.cfg.SYMBOL,
-                "side": close_side,
-                "type": "STOP_MARKET",
-                "stopPrice": str(round(stop, 1)),
-                "closePosition": "TRUE"
-            },
-            {
-                "symbol": self.cfg.SYMBOL,
-                "side": close_side,
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": str(round(take_profit, 1)),
-                "closePosition": "TRUE"
-            }
-        ]
-        
-        sl_id, tp_id = None, None
-        try:
-            # Replaced json.dumps: internal python-binance library expects a raw list
-            batch_res = self.client.futures_place_batch_order(batchOrders=batch_payload)
-            
-            # Parse the batch response
-            for res in batch_res:
-                if 'code' in res and res['code'] != 200:
-                    log.error(f"Batch order element failed: {res}")
-                    raise BinanceAPIException(res, res['code'], res.get('msg', 'Batch Error'))
-                
-                if res.get('type') == 'STOP_MARKET':
-                    sl_id = res.get('orderId')
-                elif res.get('type') == 'TAKE_PROFIT_MARKET':
-                    tp_id = res.get('orderId')
-                    
-        except Exception as e:
-            log.error(f"Batch SL/TP placement crashed: {e}. Executing immediate rollback...")
-            # Emergency Market Exit
-            try:
-                self.client.futures_create_order(
-                    symbol=self.cfg.SYMBOL, side=close_side, type="MARKET", quantity=qty
-                )
-                log.info("Rollback successful. Flushed position securely.")
-            except Exception as rollback_e:
-                log.error(f"CRITICAL: Failed to rollback position! {rollback_e}")
-            raise Exception("Trade aborted due to batch SL/TP failure.")
-
         return {
             "entry_id": entry_id,
-            "sl_id": sl_id,
-            "tp_id": tp_id,
+            "sl_id": None,
+            "tp_id": None,
         }
 
     # ── Signal Evaluation ─────────────────────────────────────────────────────
@@ -428,6 +363,26 @@ class QuantBot:
             direction = "LONG"
         elif signal < -0.15:
             direction = "SHORT"
+            
+        # Reversal Logic: Close existing trade if strategy changes direction
+        active = self.state.active_trade
+        if active and direction and direction != active["direction"]:
+            log.info(f"Strategy changed direction from {active['direction']} to {direction}. Closing existing position.")
+            try:
+                close_side = "SELL" if active["direction"] == "LONG" else "BUY"
+                if not self.cfg.PAPER_TRADE:
+                    self.client.futures_create_order(
+                        symbol=self.cfg.SYMBOL, side=close_side, type="MARKET", quantity=active["qty"]
+                    )
+                self.state.close_trade("REVERSAL", 0.0)
+            except Exception as e:
+                log.error(f"Failed to close reversed trade: {e}")
+                return
+                
+        # If we still have an active trade (because direction is None or same direction), hold position.
+        active = self.state.active_trade
+        if active:
+            return
 
         if direction is None:
             log.debug(f"No signal (momentum={signal:.3f})")
