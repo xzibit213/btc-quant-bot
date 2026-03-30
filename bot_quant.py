@@ -508,28 +508,49 @@ class QuantBot:
                 return
 
         try:
-            # Paper trade check: don't query the exchange
-            if trade.get("is_paper"):
-                try:
-                    ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
-                    mark_price = float(ticker["markPrice"])
-                except:
-                    return # Skip if network fails
-                    
-                direction = trade["direction"]
-
-                # We no longer simulate virtual SL or TP hits cleanly mimicking logic. 
-                # Paper trades will now rigorously evaluate on direct reversals just like LIVE.
+            # Shared: fetch current price for intra-candle checks
+            try:
+                ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
+                mark_price = float(ticker["markPrice"])
+            except Exception as e:
+                log.error(f"Failed to fetch mark price: {e}")
                 return
 
+            direction = trade["direction"]
+            sl = trade["stop"]
+            tp = trade["take_profit"]
+
+            # Intra-candle Protection (Virtual SL/TP Hit)
+            hit_sl = (direction == "LONG" and mark_price <= sl) or (direction == "SHORT" and mark_price >= sl)
+            hit_tp = (direction == "LONG" and mark_price >= tp) or (direction == "SHORT" and mark_price <= tp)
+
+            if hit_sl or hit_tp:
+                close_side = "SELL" if direction == "LONG" else "BUY"
+                reason = "SL" if hit_sl else "TP"
+                log.info(f"Intra-hour protection triggered! {reason} hit at ${mark_price:.2f}. Executing close.")
+                
+                if not trade.get("is_paper") and not self.cfg.PAPER_TRADE:
+                    self.client.futures_create_order(
+                        symbol=self.cfg.SYMBOL, side=close_side, type="MARKET", quantity=trade["qty"]
+                    )
+                
+                pnl = (mark_price - trade["entry"]) * trade["qty"] if direction == "LONG" else (trade["entry"] - mark_price) * trade["qty"]
+                result = "WIN" if pnl > 0 else "LOSS"
+                self.state.close_trade(result, pnl)
+                return
+
+            # Paper trade check: don't query the exchange position table
+            if trade.get("is_paper"):
+                return
+
+            # Live trade check: verify physical position exists
             positions = self.client.futures_position_information(symbol=self.cfg.SYMBOL)
             for pos in positions:
                 if pos["symbol"] == self.cfg.SYMBOL:
                     amt = float(pos["positionAmt"])
                     if abs(amt) < 0.0001:
-                        # Position is genuinely closed
+                        # Position is genuinely closed (e.g., manually)
                         entry_price = float(pos.get("entryPrice", trade["entry"]))
-                        mark_price  = float(pos.get("markPrice",  trade["entry"]))
                         direction   = trade["direction"]
                         qty         = trade["qty"]
                         pnl = (mark_price - entry_price) * qty if direction == "LONG" \
