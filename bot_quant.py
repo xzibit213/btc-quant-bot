@@ -470,17 +470,31 @@ class QuantBot:
             log.warning("Position size = 0 — skipping")
             return
 
+        # ---- DYNAMIC LEVERAGE (Fix margin at exactly 10% of balance) ----
+        target_margin = balance * 0.10
+        notional_value = qty * entry
+        required_leverage = math.ceil(notional_value / target_margin) if target_margin > 0 else 1
+        
+        # Binance limits leverage for BTC from 1x to 125x
+        required_leverage = max(1, min(required_leverage, 125))
+
         risk_usd = balance * self.cfg.RISK_PER_TRADE
         log.info(f"{'🧪 PAPER SIGNAL' if self.cfg.PAPER_TRADE else '✅ LIVE SIGNAL'} | {direction} | Momentum={signal:.3f} | "
                  f"VolLev={vol_lev:.2f}× | M_Sizing={self.state.reduction_factor:.2f} | "
-                 f"Entry≈${entry:.0f} | SL=${stop:.0f} | TP=${tp:.0f} | Qty={qty} | Risk=${risk_usd:.2f}")
+                 f"Entry≈${entry:.0f} | Qty={qty} | Risk=${risk_usd:.2f} | Leverage={required_leverage}x (10% Margin Lock)")
 
         try:
             if self.cfg.PAPER_TRADE:
                 # Bypass API and simulate order placement securely
                 order_ids = {"entry_id": f"paper_{int(time.time())}", "sl_id": "paper_sl", "tp_id": "paper_tp"}
-                log.info("PAPER TRADE MODE ACTIVE: Ignored live exchange execution.")
+                log.info(f"PAPER TRADE MODE ACTIVE: Ignored exchange execution (Required Lev: {required_leverage}x).")
             else:
+                try:
+                    self.client.futures_change_leverage(symbol=self.cfg.SYMBOL, leverage=required_leverage)
+                    log.info(f"Dynamic Leverage Updated: {required_leverage}x to strictly lock margin at 10% of balance.")
+                except Exception as e:
+                    log.error(f"Failed to set dynamic leverage: {e}")
+                    
                 order_ids = self.place_order(direction, qty, entry, stop, tp)
                 
             self.state.open_trade({
@@ -491,6 +505,7 @@ class QuantBot:
                 "take_profit": tp,
                 "qty": qty,
                 "risk_usd": risk_usd,
+                "dynamic_leverage": required_leverage,
                 "signal_strength": signal,
                 "vol_leverage": vol_lev,
                 "balance_at_entry": balance,
@@ -711,10 +726,11 @@ class QuantBot:
         start_bal = self.state.starting_balance or balance
         roi_pct = ((balance - start_bal) / start_bal * 100) if start_bal > 0 else 0.0
         
-        # Margin used
+        # Margin used (Dynamically tracked)
         margin_used = 0.0
         if self.state.active_trade:
-            margin_used = (self.state.active_trade['qty'] * self.state.active_trade['entry']) / self.cfg.LEVERAGE
+            lev = self.state.active_trade.get('dynamic_leverage', self.cfg.LEVERAGE)
+            margin_used = (self.state.active_trade['qty'] * self.state.active_trade['entry']) / lev
 
         return {
             "running":           bool(self._running),
