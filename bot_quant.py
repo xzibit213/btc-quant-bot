@@ -201,6 +201,18 @@ class QuantBot:
             self.cfg.API_KEY, self.cfg.API_SECRET,
             testnet=self.cfg.TESTNET
         )
+        
+        # --- Time Sync to prevent recvWindow crash ---
+        try:
+            res = self.client.get_server_time()
+            server_time = res['serverTime']
+            local_time = int(time.time() * 1000)
+            offset = server_time - local_time
+            self.client.timestamp_offset = offset
+            log.info(f"Time synced with Binance. Offset: {offset}ms")
+        except Exception as e:
+            log.warning(f"Failed to sync time: {e}")
+
         self.client.ping()
 
         # Get symbol info
@@ -223,10 +235,14 @@ class QuantBot:
         except Exception:
             pass # Already set
 
-        self.client.futures_change_leverage(
-            symbol=self.cfg.SYMBOL,
-            leverage=self.cfg.LEVERAGE
-        )
+        if self.cfg.API_KEY != "dummy":
+            try:
+                self.client.futures_change_leverage(
+                    symbol=self.cfg.SYMBOL,
+                    leverage=self.cfg.LEVERAGE
+                )
+            except Exception as e:
+                log.warning(f"Failed to change leverage: {e}")
         log.info(f"Connected. Leverage={self.cfg.LEVERAGE}×  LOT_SIZE={self.symbol_info}")
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -313,9 +329,10 @@ class QuantBot:
 
     def place_order(self, direction, qty, entry, stop, take_profit):
         """
-        Executes an institutional entry (Market only, as requested).
+        Executes an institutional entry with hard SL and TP.
         """
         side = "BUY"  if direction == "LONG"  else "SELL"
+        close_side = "SELL" if direction == "LONG" else "BUY"
 
         log.info(f"Placing {direction} | qty={qty} | Expected Entry=${entry:.0f}")
 
@@ -329,11 +346,39 @@ class QuantBot:
             raise  
 
         entry_id = entry_order.get("orderId", "unknown")
+        sl_id = None
+        tp_id = None
+
+        # Step 2: Place Hard Stop Loss
+        try:
+            sl_order = self.client.futures_create_order(
+                symbol=self.cfg.SYMBOL,
+                side=close_side,
+                type="STOP_MARKET",
+                stopPrice=round(stop, 1),
+                closePosition=True
+            )
+            sl_id = sl_order.get("orderId")
+        except BinanceAPIException as e:
+            log.error(f"Failed to place SL order: {e}")
+
+        # Step 3: Place Hard Take Profit
+        try:
+            tp_order = self.client.futures_create_order(
+                symbol=self.cfg.SYMBOL,
+                side=close_side,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=round(take_profit, 1),
+                closePosition=True
+            )
+            tp_id = tp_order.get("orderId")
+        except BinanceAPIException as e:
+            log.error(f"Failed to place TP order: {e}")
 
         return {
             "entry_id": entry_id,
-            "sl_id": None,
-            "tp_id": None,
+            "sl_id": sl_id,
+            "tp_id": tp_id,
         }
 
     # ── Signal Evaluation ─────────────────────────────────────────────────────
@@ -541,39 +586,23 @@ class QuantBot:
                 return
 
         try:
-            # Shared: fetch current price for intra-candle checks
-            try:
-                ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
-                mark_price = float(ticker["markPrice"])
-            except Exception as e:
-                log.error(f"Failed to fetch mark price: {e}")
-                return
-
-            direction = trade["direction"]
-            sl = trade["stop"]
-            tp = trade["take_profit"]
-
-            # Intra-candle Protection (Virtual SL/TP Hit)
-            hit_sl = (direction == "LONG" and mark_price <= sl) or (direction == "SHORT" and mark_price >= sl)
-            hit_tp = (direction == "LONG" and mark_price >= tp) or (direction == "SHORT" and mark_price <= tp)
-
-            if hit_sl or hit_tp:
-                close_side = "SELL" if direction == "LONG" else "BUY"
-                reason = "SL" if hit_sl else "TP"
-                log.info(f"Intra-hour protection triggered! {reason} hit at ${mark_price:.2f}. Executing close.")
-                
-                if not trade.get("is_paper") and not self.cfg.PAPER_TRADE:
-                    self.client.futures_create_order(
-                        symbol=self.cfg.SYMBOL, side=close_side, type="MARKET", quantity=trade["qty"]
-                    )
-                
-                pnl = (mark_price - trade["entry"]) * trade["qty"] if direction == "LONG" else (trade["entry"] - mark_price) * trade["qty"]
-                result = "WIN" if pnl > 0 else "LOSS"
-                self.state.close_trade(result, pnl)
-                return
-
             # Paper trade check: don't query the exchange position table
             if trade.get("is_paper"):
+                try:
+                    ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
+                    mark_price = float(ticker["markPrice"])
+                except Exception as e:
+                    log.error(f"Failed to fetch mark price for paper trade: {e}")
+                    return
+                sl = trade["stop"]
+                tp = trade["take_profit"]
+                direction = trade["direction"]
+                hit_sl = (direction == "LONG" and mark_price <= sl) or (direction == "SHORT" and mark_price >= sl)
+                hit_tp = (direction == "LONG" and mark_price >= tp) or (direction == "SHORT" and mark_price <= tp)
+                if hit_sl or hit_tp:
+                    pnl = (mark_price - trade["entry"]) * trade["qty"] if direction == "LONG" else (trade["entry"] - mark_price) * trade["qty"]
+                    result = "WIN" if pnl > 0 else "LOSS"
+                    self.state.close_trade(result, pnl)
                 return
 
             # Live trade check: verify physical position exists
@@ -582,12 +611,20 @@ class QuantBot:
                 if pos["symbol"] == self.cfg.SYMBOL:
                     amt = float(pos["positionAmt"])
                     if abs(amt) < 0.0001:
-                        # Position is genuinely closed (e.g., manually)
+                        # Position is genuinely closed by hard SL/TP
+                        self.cancel_open_orders() # Clean up the remaining SL or TP
                         entry_price = float(pos.get("entryPrice", trade["entry"]))
-                        direction   = trade["direction"]
-                        qty         = trade["qty"]
-                        pnl = (mark_price - entry_price) * qty if direction == "LONG" \
-                            else (entry_price - mark_price) * qty
+                        
+                        # Get mark price to approximate PnL
+                        try:
+                            ticker = self.client.futures_mark_price(symbol=self.cfg.SYMBOL)
+                            mark_price = float(ticker["markPrice"])
+                        except:
+                            mark_price = entry_price
+                        
+                        direction = trade["direction"]
+                        qty = trade["qty"]
+                        pnl = (mark_price - entry_price) * qty if direction == "LONG" else (entry_price - mark_price) * qty
                         result = "WIN" if pnl > 0 else "LOSS"
                         self.state.close_trade(result, pnl)
         except BinanceAPIException as e:
