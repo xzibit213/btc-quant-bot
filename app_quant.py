@@ -82,6 +82,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .grid { display: grid; gap: 16px; }
   .grid-stats { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
   .grid-main { grid-template-columns: 2fr 1fr; }
+  .grid-2 { grid-template-columns: 1fr 1fr; display: grid; gap: 16px; }
+  
+  @media (max-width: 900px) {
+      .grid-main { grid-template-columns: 1fr; }
+      .grid-2 { grid-template-columns: 1fr; }
+  }
   
   /* ── CARDS ───────────────────────────────── */
   .card {
@@ -106,6 +112,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .order-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
   .order-table th { text-align: left; font-size: 10px; color: var(--muted); padding: 8px; border-bottom: 1px solid var(--border); }
   .order-table td { padding: 8px; font-size: 12px; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono', monospace; }
+
+  .trade-field { display: flex; flex-direction: column; font-size: 10px; color: var(--muted); font-weight: 700; background: rgba(0,0,0,0.2); padding: 12px; border-radius: 6px; }
+  .trade-field span { font-size: 16px; font-weight: 800; margin-top: 4px; font-family: 'JetBrains Mono', monospace; color: #fff; }
+  .trade-field span.green { color: var(--green); }
+  .trade-field span.red { color: var(--red); }
 
   /* ── LOGS ────────────────────────────────── */
   .terminal {
@@ -351,8 +362,22 @@ async function fetchLog() {
   logDiv.scrollTop = logDiv.scrollHeight;
 }
 
-async function startBot() { await fetch('/api/start',{method:'POST'}); setTimeout(refresh, 1000); }
-async function stopBot() { await fetch('/api/stop',{method:'POST'}); setTimeout(refresh, 1000); }
+async function startBot() { 
+    try {
+        const res = await fetch('/api/start',{method:'POST'}); 
+        if (!res.ok) {
+            const text = await res.text();
+            alert('Error starting bot: ' + text);
+        }
+    } catch (e) {
+        alert('Network error starting bot.');
+    }
+    setTimeout(refresh, 1000); 
+}
+async function stopBot() { 
+    await fetch('/api/stop',{method:'POST'}); 
+    setTimeout(refresh, 1000); 
+}
 
 refresh(); fetchLog();
 setInterval(refresh, 5000);
